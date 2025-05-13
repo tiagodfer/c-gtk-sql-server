@@ -30,10 +30,13 @@ void stop_server_thread() {
     if (server_running) {
         server_running = FALSE;
         stop_server();
+
+        GThread *thread_to_join = server_thread;
+        server_thread = NULL;
         g_mutex_unlock(&server_mutex);
-        if (server_thread) {
-            g_thread_join(server_thread);
-            server_thread = NULL;
+
+        if (thread_to_join) {
+            g_thread_join(thread_to_join);
         }
     } else {
         g_mutex_unlock(&server_mutex);
@@ -45,7 +48,6 @@ static void activate(GtkApplication *app, gpointer user_data) {
 }
 
 int main(int argc, char *argv[]) {
-    g_mutex_init(&server_mutex);
     GtkApplication *app = gtk_application_new("org.example.C_GTK_SQL_Server", G_APPLICATION_DEFAULT_FLAGS);
     g_signal_connect(app, "activate", G_CALLBACK(activate), NULL);
     int status = g_application_run(G_APPLICATION(app), argc, argv);
