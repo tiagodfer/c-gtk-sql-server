@@ -1,5 +1,7 @@
 #include "server.h"
 #include "queries.h"
+#include "globals.h"
+#include "handlers.h"
 #include <glib.h>
 #include <openssl/ssl.h>
 #include <openssl/err.h>
@@ -14,15 +16,18 @@
 
 typedef struct {
     int client_sock;
-    char* db_path;
+    char* cpf_path;
+    char* cnpj_path;
 } ThreadData;
 
-extern GMutex server_mutex;
-extern gboolean server_running;
+GMutex server_mutex;
+gboolean server_running = FALSE;
+GThread *server_thread = NULL;
+
 static int server_sockfd = -1;
 static SSL_CTX *ssl_ctx = NULL;
 
-static void send_chunk(SSL *ssl, const char *data) {
+void send_chunk(SSL *ssl, const char *data) {
     char chunk_header[32];
     size_t data_len = strlen(data);
     snprintf(chunk_header, sizeof(chunk_header), "%zx\r\n", data_len);
@@ -31,7 +36,8 @@ static void send_chunk(SSL *ssl, const char *data) {
     SSL_write(ssl, "\r\n", 2);
 }
 
-static void handle_client(SSL *ssl, sqlite3 *db) {
+static void handle_client(SSL *ssl, sqlite3 *cpf_db, sqlite3 *cnpj_db) {
+    (void)cnpj_db; // remove this for cnpj queries
     char buffer[4096];
     ssize_t bytes = SSL_read(ssl, buffer, sizeof(buffer) - 1);
     if (bytes <= 0) {
@@ -56,50 +62,20 @@ static void handle_client(SSL *ssl, sqlite3 *db) {
     }
 
     const char *cpf_prefix = "/get-person-by-cpf/";
+    const char *name_prefix = "/get-person-by-name/";
+    const char *exact_name_prefix = "/get-person-by-exact-name/";
+
     if (strncmp(path, cpf_prefix, strlen(cpf_prefix)) == 0) {
         const char *cpf_number = path + strlen(cpf_prefix);
-        const char *headers = "HTTP/1.1 200 OK\r\n"
-            "Content-Type: application/json\r\n"
-            "Transfer-Encoding: chunked\r\n"
-            "Connection: close\r\n\r\n";
-        SSL_write(ssl, headers, strlen(headers));
-
-        json_t *result = people_by_cpf(db, cpf_number);
-        char *results_json = json_dumps(result, JSON_COMPACT);
-        char final_chunk[2048];
-        snprintf(final_chunk, sizeof(final_chunk), "{\"results\":%s}", results_json);
-        send_chunk(ssl, final_chunk);
-        SSL_write(ssl, "0\r\n\r\n", 5);
-        free(results_json);
-        json_decref(result);
-        printf("[CLIENT] Finished streaming response for cpf: %s\n", cpf_number);
+        handle_get_person_by_cpf(ssl, cpf_db, cpf_number);
         return;
-    }
-
-    const char *name_prefix = "/get-person-by-name/";
-    if (strncmp(path, name_prefix, strlen(name_prefix)) == 0) {
+    } else if (strncmp(path, name_prefix, strlen(name_prefix)) == 0) {
         const char *name = path + strlen(name_prefix);
-        const char *headers = "HTTP/1.1 200 OK\r\n"
-            "Content-Type: application/json\r\n"
-            "Transfer-Encoding: chunked\r\n"
-            "Connection: close\r\n\r\n";
-        SSL_write(ssl, headers, strlen(headers));
-
-        send_chunk(ssl, "{\"status\":\"searching\",\"message\":\"Iniciando busca...\",\"progress\":0,\"isComplete\":false}");
-        send_chunk(ssl, "{\"status\":\"searching\",\"progress\":25,\"isComplete\":false}");
-        send_chunk(ssl, "{\"status\":\"processing\",\"progress\":75,\"isComplete\":false}");
-
-        json_t *result = people_by_name(db, name);
-        char *results_json = json_dumps(result, JSON_COMPACT);
-        char final_chunk[2048];
-        snprintf(final_chunk, sizeof(final_chunk), 
-            "{\"status\":\"complete\",\"progress\":100,\"isComplete\":true,\"results\":%s}", 
-            results_json);
-        send_chunk(ssl, final_chunk);
-        SSL_write(ssl, "0\r\n\r\n", 5);
-        free(results_json);
-        json_decref(result);
-        printf("[CLIENT] Finished streaming response for name: %s\n", name);
+        handle_get_person_by_name(ssl, cpf_db, name);
+        return;
+    } else if (strncmp(path, exact_name_prefix, strlen(exact_name_prefix)) == 0) {
+        const char *name = path + strlen(exact_name_prefix);
+        handle_get_person_by_exact_name(ssl, cpf_db, name);
         return;
     }
 
@@ -110,7 +86,8 @@ static void handle_client(SSL *ssl, sqlite3 *db) {
 static gpointer handle_client_thread(gpointer data) {
     ThreadData *thread_data = (ThreadData *)data;
     int client_sock = thread_data->client_sock;
-    char *db_path = thread_data->db_path;
+    char *cpf_path = thread_data->cpf_path;
+    char *cnpj_path = thread_data->cnpj_path;
 
     SSL *ssl = SSL_new(ssl_ctx);
     SSL_set_fd(ssl, client_sock);
@@ -121,44 +98,62 @@ static gpointer handle_client_thread(gpointer data) {
         ERR_print_errors_fp(stderr);
         SSL_free(ssl);
         close(client_sock);
-        g_free(thread_data->db_path);
+        g_free(thread_data->cpf_path);
+        g_free(thread_data->cnpj_path);
         g_free(thread_data);
         return NULL;
     }
 
-    sqlite3 *db;
-    if (sqlite3_open_v2(db_path, &db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_FULLMUTEX, NULL) != SQLITE_OK) {
-        fprintf(stderr, "[THREAD] Database error: %s\n", sqlite3_errmsg(db));
+    sqlite3 *cpf_db;
+    if (sqlite3_open_v2(cpf_path, &cpf_db, SQLITE_OPEN_READONLY | SQLITE_OPEN_NOMUTEX, NULL) != SQLITE_OK) {
+        fprintf(stderr, "[THREAD] Database error: %s\n", sqlite3_errmsg(cpf_db));
         SSL_shutdown(ssl);
         SSL_free(ssl);
         close(client_sock);
-        g_free(thread_data->db_path);
+        g_free(thread_data->cpf_path);
         g_free(thread_data);
         return NULL;
     }
-    sqlite3_exec(db, "PRAGMA journal_mode=WAL;", NULL, NULL, NULL);
-    sqlite3_exec(db, "PRAGMA cache_size = -10000;", NULL, NULL, NULL);
-    sqlite3_exec(db, "PRAGMA temp_store = MEMORY;", NULL, NULL, NULL);
+    sqlite3_exec(cpf_db, "PRAGMA synchronous = NORMAL;", NULL, NULL, NULL);
+    sqlite3_exec(cpf_db, "PRAGMA journal_mode=WAL;", NULL, NULL, NULL);
+
+    sqlite3 *cnpj_db;
+    if (sqlite3_open_v2(cnpj_path, &cnpj_db, SQLITE_OPEN_READONLY | SQLITE_OPEN_NOMUTEX, NULL) != SQLITE_OK) {
+        fprintf(stderr, "[THREAD] Database error: %s\n", sqlite3_errmsg(cnpj_db));
+        SSL_shutdown(ssl);
+        SSL_free(ssl);
+        close(client_sock);
+        g_free(thread_data->cnpj_path);
+        g_free(thread_data);
+        return NULL;
+    }
+    sqlite3_exec(cnpj_db, "PRAGMA synchronous = NORMAL;", NULL, NULL, NULL);
+    sqlite3_exec(cnpj_db, "PRAGMA journal_mode=WAL;", NULL, NULL, NULL);
 
     printf("[THREAD] SSL handshake successful for client fd=%d\n", client_sock);
-    handle_client(ssl, db);
+    handle_client(ssl, cpf_db, cnpj_db);
 
     printf("[THREAD] Closing connection for client fd=%d\n", client_sock);
     SSL_shutdown(ssl);
     SSL_free(ssl);
-    sqlite3_close(db);
+    sqlite3_close(cpf_db);
+    sqlite3_close(cnpj_db);
     close(client_sock);
-    g_free(thread_data->db_path);
+    g_free(thread_data->cpf_path);
+    g_free(thread_data->cnpj_path);
     g_free(thread_data);
     return NULL;
 }
 
-int start_server(int port, const char *cpf_path) {
-    struct sockaddr_in addr = {
-        .sin_family = AF_INET,
-        .sin_addr.s_addr = htonl(INADDR_ANY),
-        .sin_port = htons(port)
-    };
+int start_server(int port, const char *cpf_path, const char *cnpj_path, const char *interface) {
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(port);
+    if (inet_pton(AF_INET, interface, &addr.sin_addr) != 1) {
+        fprintf(stderr, "[SERVER] Invalid interface IP: %s\n", interface);
+        return -1;
+    }
 
     SSL_library_init();
     OpenSSL_add_all_algorithms();
@@ -181,7 +176,7 @@ int start_server(int port, const char *cpf_path) {
         return -1;
     }
 
-    printf("[SERVER] Started on port %i.\n", port);
+    printf("[SERVER] Started on %s:%i.\n", interface, port);
     while (TRUE) {
         struct timeval tv = {1, 0};
         fd_set fds;
@@ -203,7 +198,8 @@ int start_server(int port, const char *cpf_path) {
             printf("[SERVER] Accepted connection (fd=%d)\n", client_sock);
             ThreadData *data = g_new(ThreadData, 1);
             data->client_sock = client_sock;
-            data->db_path = g_strdup(cpf_path);
+            data->cpf_path = g_strdup(cpf_path);
+            data->cnpj_path = g_strdup(cnpj_path);
 
             GThread *client_thread = g_thread_new(
                 "client_handler",
@@ -224,12 +220,10 @@ int stop_server() {
         close(server_sockfd);
         server_sockfd = -1;
     }
-
     if (ssl_ctx) {
         SSL_CTX_free(ssl_ctx);
         ssl_ctx = NULL;
     }
-
     printf("[SERVER] Stopped\n");
     return 0;
 }

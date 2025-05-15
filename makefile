@@ -1,10 +1,10 @@
 CC = gcc
 SRC_DIR = src
-INC_DIR = includes
+INC_DIR = inc
 OBJ_DIR = obj
 BIN = c-gtk-sql-server
 
-CFLAGS = -Wall -g -I$(INC_DIR) `pkg-config --cflags gtk4`
+CFLAGS = -Wall -Wextra -g -I$(INC_DIR) `pkg-config --cflags gtk4`
 LDFLAGS = `pkg-config --libs gtk4 jansson` -lsqlite3 -lssl -lcrypto
 
 SRCS = $(wildcard $(SRC_DIR)/*.c)

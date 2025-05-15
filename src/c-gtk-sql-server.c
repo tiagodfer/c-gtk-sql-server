@@ -3,15 +3,13 @@
 #include "gui.h"
 #include "server.h"
 #include "c-gtk-sql-server.h"
-
-GMutex server_mutex;
-gboolean server_running = FALSE;
-GThread *server_thread = NULL;
+#include "globals.h"
 
 static gpointer server_thread_func(gpointer data) {
     ServerParams *params = (ServerParams *)data;
-    start_server(params->port, params->file_path);
-    g_free(params->file_path);
+    start_server(params->port, params->cpf_path, params->cnpj_path, params->interface);
+    g_free(params->cpf_path);
+    g_free(params->cnpj_path);
     g_free(params);
     return NULL;
 }
@@ -43,7 +41,8 @@ void stop_server_thread() {
     }
 }
 
-static void activate(GtkApplication *app, gpointer user_data) {
+static void activate(GtkApplication *app, gpointer data) {
+    (void)data;
     create_main_window(app);
 }
 
